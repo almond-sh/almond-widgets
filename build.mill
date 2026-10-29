@@ -158,11 +158,9 @@ def buildVersion: T[String] = Task.Input {
     if (latestTag.exitCode == 0) {
       val latest = latestTag.out.trim().stripPrefix("v")
       val fields = latest.split('.').take(3)
-      assert(
-        fields.length == 3 && fields(2).takeWhile(_.isDigit).nonEmpty,
-        s"Expected the latest tag ($latest) to look like a version with 3 fields"
-      )
-      fields.update(2, (fields(2).takeWhile(_.isDigit).toInt + 1).toString)
+      val last   = fields.last.takeWhile(_.isDigit)
+      assert(last.nonEmpty, s"Expected the latest tag ($latest) to end with a number")
+      fields.update(fields.length - 1, (last.toInt + 1).toString)
       fields.mkString(".") + "-SNAPSHOT"
     }
     else
