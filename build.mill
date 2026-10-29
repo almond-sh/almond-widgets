@@ -1,0 +1,172 @@
+//| mill-version: 1.3.0
+
+import widgetsbuild.*
+
+import coursier.version.Version
+import mill.*
+import mill.api.*
+import mill.javalib.api.JvmWorkerUtil
+import mill.javalib.publish.*
+import mill.scalalib.*
+
+/** Jupyter widgets, for the Scala kernel of almond
+  *
+  * Users load it like any library (`sh.almond::widgets`). Most widget classes are generated from
+  * the model schema of ipywidgets, downloaded by the build (see [[widgetsbuild.WidgetModelSchema]]
+  * and [[widgetsbuild.WidgetsGenerator]]).
+  */
+object widgets extends Cross[Widgets](ScalaVersions.binaries)
+
+trait Widgets extends CrossScalaModule with WidgetsScalaModule with PublishModule {
+  def mvnDeps = Seq(
+    Deps.almondApi,
+    Deps.ujson
+  )
+
+  // Target the oldest JVM almond supports
+  def javacOptions = super.javacOptions() ++ Seq("--release", "8")
+  def scalacOptions = Task {
+    val sv = Version(scalaVersion())
+    val targetOptions =
+      // -target:8 is only accepted from 2.12.16, and -release only works from 2.12.12
+      if (sv >= Version("2.12.0") && sv < Version("2.12.16")) Seq("-target:jvm-1.8")
+      else if (sv >= Version("2.12.16") && sv <= Version("2.12.18")) Seq("-target:8")
+      else Seq("--release", "8")
+    super.scalacOptions() ++ targetOptions
+  }
+
+  /** The model schema of ipywidgets, `packages/schema/jupyterwidgetmodels.latest.json` in its
+    * repository
+    */
+  def widgetModelSchema = Task {
+    val schema = WidgetModelSchema.fetch(Versions.ipywidgets, Versions.ipywidgetsSchemaSha256)
+    val dest   = Task.dest / "jupyterwidgetmodels.json"
+    os.copy(schema, dest)
+    PathRef(dest)
+  }
+
+  def generatedSources = Task {
+    val schema = ujson.read(os.read(widgetModelSchema().path))
+    for ((path, content) <- WidgetsGenerator.generate(schema))
+      os.write(Task.dest / path, content, createFolders = true)
+    Seq(PathRef(Task.dest)) ++ super.generatedSources()
+  }
+
+  def publishVersion = Task(buildVersion())
+  def pomSettings = PomSettings(
+    description = "Jupyter widgets for almond",
+    organization = "sh.almond",
+    url = "https://github.com/almond-sh/almond-widgets",
+    licenses = Seq(License.`BSD-3-Clause`),
+    versionControl = VersionControl.github("almond-sh", "almond-widgets"),
+    developers = Seq(
+      Developer("alexarchambault", "Alex Archambault", "https://github.com/alexarchambault")
+    )
+  )
+  // Like almond, we don't publish any documentation, just empty doc JARs
+  def docJar = Task {
+    val dest = Task.dest / "empty.jar"
+    val zos  = new java.util.zip.ZipOutputStream(os.write.outputStream(dest))
+    zos.finish()
+    zos.close()
+    PathRef(dest)
+  }
+
+  /** Unit tests, built for each full Scala version of [[ScalaVersions.tests]] */
+  object test        extends Cross[WidgetsTests](ScalaVersions.testsFor(crossValue))
+  trait WidgetsTests extends WidgetsTestModule
+
+  /** Tests of widgets running in the Scala kernel, along with a pseudo front-end */
+  object `kernel-test` extends Cross[WidgetsKernelTests](ScalaVersions.testsFor(crossValue))
+  trait WidgetsKernelTests extends WidgetsTestModule {
+    def mvnDeps = super.mvnDeps() ++ Seq(
+      Deps.almondScalaInterpreter,
+      Deps.scalaCompiler(scalaVersion())
+    )
+  }
+
+  /** Tests of this module, built and run with a full Scala version of its binary version
+    *
+    * Unlike Mill's test modules, they don't share the Scala version of the module they test, which
+    * is built with the oldest Scala version of its binary version.
+    */
+  trait WidgetsTestModule extends Cross.Module[String] with WidgetsScalaModule
+      with TestModule.Utest {
+    def scalaVersion = crossValue
+    def moduleDeps   = Seq(Widgets.this)
+    def mvnDeps      = Seq(Deps.utest)
+
+    // Force the Scala artifacts the modules we depend on pull to our Scala version. Mill forces the
+    // ones whose name it can spell out without the Scala 3 suffix, which leaves
+    // scala3-compiler_3 and scala3-library_3 at whatever version these pull.
+    def resolutionParams = Task.Anon {
+      val sv       = scalaVersion()
+      val org      = JvmWorkerUtil.scalaOrganization(sv)
+      val suffixes = if (JvmWorkerUtil.isScala3(sv)) Seq("", "_3") else Seq("")
+      val modules =
+        for (name <- Lib.scalaArtifacts(sv).toSeq.sorted; suffix <- suffixes)
+          yield coursier.Module(
+            coursier.Organization(org),
+            coursier.ModuleName(name + suffix),
+            Map.empty
+          ) -> coursier.version.VersionConstraint(sv)
+      super.resolutionParams().addForceVersion0(modules*)
+    }
+  }
+}
+
+/** Things all our Scala modules share */
+trait WidgetsScalaModule extends ScalaModule {
+
+  // For the snapshots of almond, and of its Ammonite fork
+  def repositories = Task {
+    super.repositories() ++ Seq("central:maven-snapshots")
+  }
+
+  // Run the compiler of old Scala versions on a JVM they support (see ScalaVersions.jvmVersionFor).
+  // Mill runs the tests of the module with that JVM too.
+  def jvmVersion = Task {
+    ScalaVersions.jvmVersionFor(scalaVersion()).getOrElse(super.jvmVersion())
+  }
+
+  def scalacOptions = Task {
+    val scala2Options =
+      if (scalaVersion().startsWith("2.")) Seq("-explaintypes")
+      else Nil
+    super.scalacOptions() ++ scala2Options ++ Seq(
+      "-deprecation",
+      "-feature",
+      "-encoding",
+      "utf-8",
+      "-language:higherKinds",
+      "-unchecked"
+    )
+  }
+}
+
+/** The version we publish: the one of the "v*" tag of the current commit if there is one, else a
+  * snapshot of the version following the latest tag
+  */
+def buildVersion: T[String] = Task.Input {
+  def git(args: String*) =
+    os.proc("git", args).call(stderr = os.Pipe, check = false)
+  val exactTag = git("describe", "--exact-match", "--tags", "--match", "v*", "HEAD")
+  if (exactTag.exitCode == 0)
+    exactTag.out.trim().stripPrefix("v")
+  else {
+    val latestTag = git("describe", "--abbrev=0", "--tags", "--match", "v*")
+    if (latestTag.exitCode == 0) {
+      val latest = latestTag.out.trim().stripPrefix("v")
+      val fields = latest.split('.').take(3)
+      assert(
+        fields.length == 3 && fields(2).takeWhile(_.isDigit).nonEmpty,
+        s"Expected the latest tag ($latest) to look like a version with 3 fields"
+      )
+      fields.update(2, (fields(2).takeWhile(_.isDigit).toInt + 1).toString)
+      fields.mkString(".") + "-SNAPSHOT"
+    }
+    else
+      // nothing released yet
+      "0.1.0-SNAPSHOT"
+  }
+}

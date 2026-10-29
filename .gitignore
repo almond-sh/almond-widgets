@@ -1,0 +1,8 @@
+out/
+.bsp/
+.bloop/
+.metals/
+.idea/
+.vscode/
+.DS_Store
+.ipynb_checkpoints/
